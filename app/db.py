@@ -63,6 +63,100 @@ CREATE TABLE IF NOT EXISTS calc_state (
     last_error TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
 );
+
+-- ---------------------------------------------------------------- 备机补数
+-- 每次上传备机 CSV 生成一个不可变文件版本；整批替换生效，失败不改变 active。
+CREATE TABLE IF NOT EXISTS backup_files (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename         TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL,
+    interval_start   TEXT NOT NULL,          -- 断流闭区间起点（UTC，含）
+    interval_end     TEXT NOT NULL,          -- 断流闭区间终点（UTC，含）
+    interval_start_ms INTEGER NOT NULL,
+    interval_end_ms   INTEGER NOT NULL,
+    rows_total       INTEGER NOT NULL,
+    rows_in_interval INTEGER NOT NULL,
+    conflict_count   INTEGER NOT NULL DEFAULT 0,
+    is_active        INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_backup_files_active
+    ON backup_files(is_active) WHERE is_active = 1;
+
+CREATE TABLE IF NOT EXISTS backup_rows (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id     INTEGER NOT NULL REFERENCES backup_files(id),
+    row_no      INTEGER NOT NULL,            -- 备机 CSV 数据行号（从 1 起）
+    utc_time    TEXT NOT NULL,
+    utc_ms      INTEGER NOT NULL,
+    temperature REAL NOT NULL,
+    in_interval INTEGER NOT NULL,            -- 1 表示落在断流区间内
+    UNIQUE (file_id, row_no)
+);
+CREATE INDEX IF NOT EXISTS idx_backup_rows_file ON backup_rows(file_id, in_interval);
+
+CREATE TABLE IF NOT EXISTS backup_conflicts (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id  INTEGER NOT NULL REFERENCES backup_files(id),
+    utc_time TEXT NOT NULL,
+    utc_ms   INTEGER NOT NULL,
+    details  TEXT NOT NULL                   -- JSON：[{row_no, utc_time, temperature}, ...]
+);
+CREATE INDEX IF NOT EXISTS idx_backup_conflicts_file ON backup_conflicts(file_id);
+
+-- 合并结果也是不可变快照：绑定一个主机发布版 + 一个备机文件。
+CREATE TABLE IF NOT EXISTS merged_results (
+    version              INTEGER PRIMARY KEY AUTOINCREMENT,
+    master_calc_version  INTEGER NOT NULL,   -- 使用的主机已发布校时版本
+    backup_file_id       INTEGER NOT NULL REFERENCES backup_files(id),
+    interval_start       TEXT NOT NULL,
+    interval_end         TEXT NOT NULL,
+    status               TEXT NOT NULL,      -- ready / undeliverable
+    deliverable          INTEGER NOT NULL,   -- 1/0；冲突区间为 0
+    conflict_count       INTEGER NOT NULL,
+    master_count         INTEGER NOT NULL,
+    backup_count         INTEGER NOT NULL,
+    omitted_near_master  INTEGER NOT NULL,
+    omitted_outside      INTEGER NOT NULL,
+    omitted_duplicate    INTEGER NOT NULL,
+    omitted_conflict     INTEGER NOT NULL,
+    created_at           TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS merged_readings (
+    merged_version INTEGER NOT NULL REFERENCES merged_results(version),
+    source         TEXT NOT NULL CHECK (source IN ('master', 'backup')),
+    source_ref     INTEGER NOT NULL,         -- master: readings.id；backup: backup_rows.id
+    batch_id       INTEGER,                  -- 仅主机
+    backup_file_id INTEGER,                  -- 仅备机
+    row_no         INTEGER NOT NULL,         -- 原 CSV 数据行号
+    segment        INTEGER,                  -- 仅主机
+    local_seconds  INTEGER,                  -- 仅主机
+    temperature    REAL NOT NULL,
+    utc_time       TEXT NOT NULL,
+    utc_ms         INTEGER NOT NULL,
+    utc_date       TEXT NOT NULL,
+    anchor_version INTEGER,                  -- 仅主机
+    calc_version   INTEGER,                  -- 仅主机：取自的主机发布版
+    PRIMARY KEY (merged_version, source, source_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_merged_readings_day
+    ON merged_readings(merged_version, utc_date, utc_ms);
+
+CREATE TABLE IF NOT EXISTS merged_conflicts (
+    merged_version INTEGER NOT NULL REFERENCES merged_results(version),
+    utc_time       TEXT NOT NULL,
+    utc_ms         INTEGER NOT NULL,
+    details        TEXT NOT NULL,
+    PRIMARY KEY (merged_version, utc_ms)
+);
+
+CREATE TABLE IF NOT EXISTS merge_state (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    version    INTEGER NOT NULL DEFAULT 0,   -- 当前生效的合并结果版本
+    status     TEXT NOT NULL DEFAULT 'idle', -- idle / running / failed
+    last_error TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -89,7 +183,18 @@ class Database:
                 "INSERT OR IGNORE INTO meta(key, value) VALUES ('calibrated_generation', '-1')"
             )
             self._conn.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES ('merge_pending_rev', '1')"
+            )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES ('merge_built_rev', '0')"
+            )
+            self._conn.execute(
                 "INSERT OR IGNORE INTO calc_state(id, version, status, updated_at)"
+                " VALUES (1, 0, 'idle', ?)",
+                (utcnow_iso(),),
+            )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO merge_state(id, version, status, updated_at)"
                 " VALUES (1, 0, 'idle', ?)",
                 (utcnow_iso(),),
             )

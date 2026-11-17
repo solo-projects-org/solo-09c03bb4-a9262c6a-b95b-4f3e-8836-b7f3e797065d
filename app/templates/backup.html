@@ -1,0 +1,131 @@
+{% extends "base.html" %}
+{% block title %}备机补数 - 冷链记录仪校时平台{% endblock %}
+{% block content %}
+<h2>备机补数</h2>
+
+<div class="card">
+  <p class="hint">
+    主记录仪断流期间，用备机记录补齐逐日温度。上传一个<b>包含 UTC 与温度</b>的备机 CSV，
+    并指定断流闭区间（起止均含，UTC）。最多 {{ cfg.max_points }} 点。<br>
+    合并规则：主机已发布读数优先；备机点仅在断流区间内、且与任一主机点相距<b>严格超过 5 秒</b>时补入。
+    备机同一 UTC 存在不同温度时，该断流区间<b>不可交付</b>，冲突会原样列出。<br>
+    <b>更换备机文件整批生效</b>；校验失败时整批拒绝，仍沿用原备机文件。
+  </p>
+  <form method="post" action="/backup" enctype="multipart/form-data">
+    <p><label>断流起点 (UTC)</label>
+       <input type="text" name="start" size="24" placeholder="2026-01-01 08:00:00" required></p>
+    <p><label>断流终点 (UTC)</label>
+       <input type="text" name="end" size="24" placeholder="2026-01-01 12:00:00" required></p>
+    <p><label>备机 CSV</label>
+       <input type="file" name="file" accept=".csv,text/csv" required>
+       <button type="submit">上传并整批生效</button></p>
+  </form>
+  <p class="hint">
+    表头：<span class="mono">utc_time,temperature</span>
+    （或中文 <span class="mono">UTC时间,温度</span>；无表头时按此顺序）。行号为数据行序号（从 1 起，不含表头）。
+  </p>
+  {% if error %}
+  <div class="msg err">
+    <b>{{ error.message }}</b>
+    {% if error.errors %}
+    <table>
+      <tr><th>行号</th><th>问题</th></tr>
+      {% for e in error.errors %}
+      <tr><td>{{ e.row }}</td><td>{{ e.message }}</td></tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+
+<h3>当前生效的备机文件</h3>
+{% if active %}
+<div class="card">
+  <p>
+    文件 <b>#{{ active.id }}</b>（{{ active.filename or '未命名' }}）
+    断流区间：<span class="mono">{{ active.interval_start }} ～ {{ active.interval_end }}</span>
+    （闭区间）
+  </p>
+  <p>
+    总行数 {{ active.rows_total }}　区间内 {{ active.rows_in_interval }}
+    区间外（忽略）{{ active.rows_total - active.rows_in_interval }}
+    冲突 UTC 数
+    {% if active.conflict_count %}<span class="err"><b>{{ active.conflict_count }}</b></span>
+    {% else %}<span class="ok">0</span>{% endif %}
+  </p>
+  <p class="hint">上传时间：{{ active.created_at }}</p>
+</div>
+{% else %}
+<p class="hint">尚未上传备机文件。</p>
+{% endif %}
+
+{% if conflicts %}
+<h3>备机冲突（同一 UTC 不同温度）</h3>
+<p class="err">当前备机文件存在 {{ conflicts|length }} 个冲突 UTC，该断流区间<strong>不可交付</strong>。</p>
+<table>
+  <tr><th>UTC</th><th>行号</th><th>温度</th></tr>
+  {% for c in conflicts %}
+    {% for d in c.details %}
+    <tr>
+      <td class="mono">{{ c.utc_time }}</td>
+      <td>{{ d.row_no }}</td>
+      <td class="err">{{ d.temperature }}</td>
+    </tr>
+    {% endfor %}
+  {% endfor %}
+</table>
+{% endif %}
+
+<h3>最新合并结果</h3>
+{% if latest %}
+<div class="card">
+  <p>
+    合并版本 <b>v{{ latest.version }}</b>
+    基于主机发布版 <b>v{{ latest.master_calc_version }}</b> + 备机文件 <b>#{{ latest.backup_file_id }}</b>
+  </p>
+  <p>
+    状态：
+    {% if info.status == 'waiting' %}
+      <span class="warn">等待主机重算完成（主机未发布新版前旧合并结果仅供回看）</span>
+    {% elif info.pending or not info.latest_current %}
+      <span class="warn">旧合并结果仅供回看（合并与主机换版/备机替换交错，或待重算）</span>
+    {% elif info.latest_deliverable %}
+      <span class="ok">可交付</span>
+    {% else %}
+      <span class="err">不可交付（存在冲突 UTC）</span>
+    {% endif %}
+    　合并读数：主机 {{ latest.master_count }} + 备机 {{ latest.backup_count }} = {{ latest.master_count + latest.backup_count }}
+  </p>
+  <p class="hint">
+    补入统计：距主机 ≤5 秒而跳过 {{ latest.omitted_near_master }}，
+    区间外忽略 {{ latest.omitted_outside }}，
+    同 UTC 同温重复 {{ latest.omitted_duplicate }}，
+    冲突跳过 {{ latest.omitted_conflict }}。
+  </p>
+  <p><a href="/merged?date={{ latest.interval_start[:10] }}">查看合并读数（按日）</a></p>
+</div>
+{% else %}
+<p class="hint">尚无合并结果。</p>
+{% endif %}
+
+<h3>备机文件版本</h3>
+{% if files %}
+<table>
+  <tr><th>#</th><th>文件名</th><th>断流区间</th><th>总行数</th><th>区间内</th>
+      <th>冲突 UTC</th><th>生效</th><th>上传时间</th></tr>
+  {% for f in files %}
+  <tr>
+    <td>{{ f.id }}</td><td>{{ f.filename }}</td>
+    <td class="mono">{{ f.interval_start }} ～ {{ f.interval_end }}</td>
+    <td>{{ f.rows_total }}</td><td>{{ f.rows_in_interval }}</td>
+    <td>{% if f.conflict_count %}<span class="err">{{ f.conflict_count }}</span>{% else %}0{% endif %}</td>
+    <td>{% if f.is_active %}<span class="ok">当前</span>{% else %}历史{% endif %}</td>
+    <td class="mono">{{ f.created_at }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="hint">尚无备机文件。</p>
+{% endif %}
+{% endblock %}

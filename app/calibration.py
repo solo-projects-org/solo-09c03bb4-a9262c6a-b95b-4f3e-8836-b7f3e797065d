@@ -102,6 +102,11 @@ def commit_calc(db: Database, generation: int, rows: list[dict]) -> int:
         cur.execute(
             "UPDATE meta SET value = ? WHERE key = 'calibrated_generation'", (str(generation),)
         )
+        # 主机发布了新校时版本：合并结果须基于新发布版重建
+        cur.execute(
+            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
+            " WHERE key = 'merge_pending_rev'"
+        )
     return new_version
 
 
@@ -115,7 +120,8 @@ def set_status(db: Database, status: str, last_error: str = "") -> None:
 class RecalcWorker:
     """后台重算线程：事件触发，循环重算直至 已校代次 == 状态代次。"""
 
-    def __init__(self, db: Database, delay: float = 0.0, max_failures: int = 3):
+    def __init__(self, db: Database, delay: float = 0.0, max_failures: int = 3,
+                 on_commit=None):
         self.db = db
         self.delay = delay            # 提交前人为延迟，仅用于演示/测试并发窗口
         self.max_failures = max_failures
@@ -123,6 +129,7 @@ class RecalcWorker:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._failures = 0
+        self.on_commit = on_commit    # 主机发布新版后的回调（通知合并线程）
 
     def start(self) -> None:
         if self._thread is not None:
@@ -165,6 +172,8 @@ class RecalcWorker:
                     time.sleep(self.delay)  # 放大并发窗口（演示/测试）
                 commit_calc(self.db, state_gen, rows)
                 self._failures = 0
+                if self.on_commit is not None:
+                    self.on_commit()
             except StaleState:
                 log.info("状态已变化，丢弃过期计算并重算")
                 continue
@@ -175,3 +184,98 @@ class RecalcWorker:
                 if self._failures >= self.max_failures:
                     return
                 time.sleep(0.2)
+
+
+class MergeWorker:
+    """备机合并的串行执行器。
+
+    合并必须与「主机换版 / 备机文件替换」在同一个数据库写锁上串行：
+    任一相关变更发生时 ``bump()`` 递增 merge_state.pending_rev；
+    合并线程在锁内读取一致快照（主机已发布校时版本 + 当前备机文件 + 合并代次），
+    计算完成后在同一事务内复核代次，不一致则整次丢弃重算。
+    因此任何一次提交只可能对应「一个主机发布版 + 一个备机文件」，不会混版。
+
+    与主机重算不同，合并结果不要求“实时追上最新”，主机重算进行中时旧合并结果
+    仍然完整可回看（页面会标注落后），但查询返回的永远是一个完整快照。
+    """
+
+    def __init__(self, db: Database, delay: float = 0.0, max_failures: int = 3):
+        self.db = db
+        self.delay = delay
+        self.max_failures = max_failures
+        self._event = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._failures = 0
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._loop, name="merge-worker", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+            self._thread = None
+
+    def trigger(self) -> None:
+        self._event.set()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self._event.wait(timeout=10)
+            self._event.clear()
+            if self._stop.is_set():
+                break
+            try:
+                self.run_until_quiet()
+            except Exception:  # pragma: no cover - 防御
+                log.exception("合并循环出现异常")
+
+    def run_until_quiet(self) -> None:
+        while not self._stop.is_set():
+            pending = _meta_int(self.db, "merge_pending_rev")
+            built = _meta_int(self.db, "merge_built_rev")
+            if pending == built:
+                self._failures = 0
+                return
+            set_merge_status(self.db, "running")
+            try:
+                from .merge import WaitForMaster, build_and_commit
+
+                if self.delay > 0:
+                    time.sleep(self.delay)
+                build_and_commit(self.db, pending)
+                self._failures = 0
+            except WaitForMaster as exc:
+                # 主机有变更尚未发布：不生成合并结果，等主机提交后再触发。
+                # 旧合并结果仍可回看（查询侧会标记为不可交付）。
+                log.info("等待主机重算完成后再合并：%s", exc)
+                self._failures = 0
+                set_merge_status(self.db, "waiting", str(exc)[:500])
+                return
+            except StaleState:
+                log.info("主机/备机已变化，丢弃过期合并并重算")
+                continue
+            except Exception as exc:
+                self._failures += 1
+                log.warning("合并失败（第 %s 次）：%s", self._failures, exc)
+                set_merge_status(self.db, "failed", str(exc)[:500])
+                if self._failures >= self.max_failures:
+                    return
+                time.sleep(0.2)
+
+
+def _meta_int(db: Database, key: str) -> int:
+    row = db.query_one("SELECT value FROM meta WHERE key = ?", (key,))
+    return int(row["value"]) if row else 0
+
+
+def set_merge_status(db: Database, status: str, last_error: str = "") -> None:
+    db.execute(
+        "UPDATE merge_state SET status = ?, last_error = ?, updated_at = ? WHERE id = 1",
+        (status, last_error, utcnow_iso()),
+    )

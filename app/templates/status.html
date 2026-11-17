@@ -25,6 +25,43 @@
   </form>
 </div>
 
+<h3>备机补数 / 合并状态</h3>
+<div class="card">
+  {% if merge_info.active_file %}
+  <p>
+    生效备机文件：<b>#{{ merge_info.active_file.id }}</b>
+    （{{ merge_info.active_file.filename or '未命名' }}）
+    断流区间 <span class="mono">{{ merge_info.active_file.interval_start }} ～ {{ merge_info.active_file.interval_end }}</span>
+    {% if merge_info.active_file.conflict_count %}
+    <span class="err">　冲突 UTC：{{ merge_info.active_file.conflict_count }}（不可交付）</span>
+    {% endif %}
+  </p>
+  {% else %}
+  <p class="hint">尚无备机文件。请到「备机补数」页上传。</p>
+  {% endif %}
+  <p>
+    合并状态：
+    {% if merge_info.status == 'running' %}<span class="warn">合并中…</span>
+    {% elif merge_info.status == 'waiting' %}<span class="warn">等待主机重算完成</span>
+    {% elif merge_info.status == 'failed' %}<span class="err">失败（旧合并结果仍可回看）</span>
+    {% else %}<span class="ok">空闲</span>{% endif %}
+    　当前合并版本：<b>v{{ merge_info.version }}</b>
+    {% if merge_info.pending %}<span class="warn">（有变更待合并）</span>{% endif %}
+  </p>
+  {% if merge_info.last_error %}<p class="err">最近错误：{{ merge_info.last_error }}</p>{% endif %}
+  {% if merge_info.latest %}
+  <p class="hint">
+    最近合并 v{{ merge_info.latest.version }}
+    基于主机发布版 v{{ merge_info.latest.master_calc_version }} + 备机文件
+    #{{ merge_info.latest.backup_file_id }}；
+    {% if merge_info.latest_deliverable %}<span class="ok">可交付</span>
+    {% elif not merge_info.latest_current %}<span class="warn">仅供回看（落后于当前主机/备机版本）</span>
+    {% else %}<span class="err">不可交付（存在冲突 UTC）</span>{% endif %}
+    <a href="/merged?date={{ merge_info.latest.interval_start[:10] }}">查看合并读数</a>
+  </p>
+  {% endif %}
+</div>
+
 <h3>校时锚点</h3>
 {% if st.anchors %}
 <table>

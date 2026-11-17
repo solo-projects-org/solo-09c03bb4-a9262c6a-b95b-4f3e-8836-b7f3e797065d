@@ -1,0 +1,133 @@
+{% extends "base.html" %}
+{% block title %}合并读数 - 冷链记录仪校时平台{% endblock %}
+{% block content %}
+<h2>合并读数（主机 + 备机补数）</h2>
+
+<div class="card">
+  <form method="get" action="/merged">
+    <label>UTC 日期</label>
+    <input type="date" name="date" value="{{ date }}" required>
+    <label>回看版本</label>
+    <input type="number" name="version" min="1" value="{{ version }}"
+           placeholder="留空=当前合并版">
+    <button type="submit">查询</button>
+  </form>
+  <p class="hint">
+    合并结果绑定「一个主机已发布校时版本 + 一个备机文件版本」，按日展示来源、原行号与主机锚点版本。
+    主机换版或备机替换后尚未重算时，旧合并结果只能回看（标记为不可交付），不会被混入新数据。
+  </p>
+</div>
+
+{% if error %}<div class="msg err">{{ error }}</div>{% endif %}
+
+{% if result and not result.available %}
+<div class="card">
+  <p class="hint">{{ result.reason }}</p>
+  <p>
+    合并状态：{{ result.merge.status }}
+    　当前合并版本：v{{ result.merge.current_version }}
+    {% if result.merge.pending %}<span class="warn">（待重算）</span>{% endif %}
+  </p>
+  {% if result.active_file %}
+  <p>当前备机文件：#{{ result.active_file.id }}
+    断流区间 <span class="mono">{{ result.active_file.interval_start }} ～ {{ result.active_file.interval_end }}</span></p>
+  {% endif %}
+</div>
+{% elif result %}
+<div class="card">
+  <p>
+    合并版本 <b>v{{ result.version }}</b>
+    {% if result.historical %}<span class="warn">（历史版本，当前 v{{ result.current_version }}，仅供回看）</span>{% endif %}
+    　主机发布版 <b>v{{ result.master_calc_version }}</b>
+    　备机文件 <b>#{{ result.backup_file_id }}</b>（{{ result.backup_filename or '未命名' }}）
+  </p>
+  <p>
+    断流闭区间：<span class="mono">{{ result.interval_start }} ～ {{ result.interval_end }}</span>
+    　生成时间：<span class="mono">{{ result.created_at }}</span>
+  </p>
+  <p>
+    交付状态：
+    {% if result.deliverable %}
+      <span class="ok"><b>可交付</b></span>
+    {% else %}
+      <span class="err"><b>不可交付</b></span>
+      {% if result.stale_reasons %}
+      <span class="hint">（{{ result.stale_reasons | join('；') }}）</span>
+      {% endif %}
+      {% if result.conflicts %}
+      <span class="hint">（{{ result.conflicts | length }} 个 UTC 存在异温冲突，见下方列表）</span>
+      {% endif %}
+    {% endif %}
+    {% if info.pending and not result.stale %}
+    <span class="hint">　合并待重算，本页展示最近一次完整合并快照。</span>
+    {% endif %}
+  </p>
+  <p class="hint">
+    补入统计：距主机 ≤5 秒而跳过 {{ result.omitted.near_master }}，
+    区间外忽略 {{ result.omitted.outside_interval }}，
+    同 UTC 同温重复 {{ result.omitted.duplicate }}，
+    冲突跳过 {{ result.omitted.conflict }}。
+  </p>
+</div>
+
+<h3>{{ result.date }}（UTC）合并读数：{{ result.count }} 条
+    <span class="hint">（主机 {{ result.master_count }} + 备机 {{ result.backup_count }}）</span></h3>
+{% if result.count %}
+<table>
+  <tr><th>UTC</th><th>来源</th><th>温度</th><th>批次号</th><th>原行号</th>
+      <th>段号</th><th>本地秒数</th><th>主机锚点版本</th><th>备机文件</th></tr>
+  {% for r in result.readings %}
+  <tr>
+    <td class="mono">{{ r.utc_time }}</td>
+    <td>{% if r.source == 'master' %}<span class="ok">主机</span>{% else %}备机{% endif %}</td>
+    <td>{{ r.temperature }}</td>
+    <td>{% if r.batch_id is not none %}{{ r.batch_id }}{% else %}—{% endif %}</td>
+    <td>{{ r.row_no }}</td>
+    <td>{% if r.segment is not none %}{{ r.segment }}{% else %}—{% endif %}</td>
+    <td class="mono">{% if r.local_seconds is not none %}{{ r.local_seconds }}{% else %}—{% endif %}</td>
+    <td>{% if r.anchor_version is not none %}v{{ r.anchor_version }}{% else %}—{% endif %}</td>
+    <td>{% if r.backup_file_id %}#{{ r.backup_file_id }}{% else %}—{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="hint">该日无合并读数。</p>
+{% endif %}
+
+{% if result.conflicts %}
+<h3>冲突（该区间不可交付）</h3>
+<table>
+  <tr><th>UTC</th><th>行号</th><th>温度</th></tr>
+  {% for c in result.conflicts %}
+    {% for d in c.details %}
+    <tr>
+      <td class="mono">{{ c.utc_time }}</td>
+      <td>{{ d.row_no }}</td>
+      <td class="err">{{ d.temperature }}</td>
+    </tr>
+    {% endfor %}
+  {% endfor %}
+</table>
+{% endif %}
+{% endif %}
+
+{% if history %}
+<h3>合并版本（最近 {{ history|length }} 个，可回看）</h3>
+<table>
+  <tr><th>版本</th><th>主机发布版</th><th>备机文件</th><th>断流区间</th>
+      <th>状态</th><th>合并读数</th><th>生成时间</th><th></th></tr>
+  {% for h in history %}
+  <tr>
+    <td>v{{ h.version }}</td>
+    <td>v{{ h.master_calc_version }}</td>
+    <td>#{{ h.backup_file_id }}</td>
+    <td class="mono">{{ h.interval_start }} ～ {{ h.interval_end }}</td>
+    <td>{% if h.deliverable %}<span class="ok">可交付</span>{% else %}<span class="err">不可交付</span>{% endif %}</td>
+    <td>主机 {{ h.master_count }} + 备机 {{ h.backup_count }}</td>
+    <td class="mono">{{ h.created_at }}</td>
+    <td><a href="/merged?date={{ date or h.interval_start[:10] }}&version={{ h.version }}">回看</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}
